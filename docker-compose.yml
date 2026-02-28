@@ -1,0 +1,244 @@
+# OpenClaw – hardened local deployment
+# Docs: ./README.md
+#
+# Quick start:
+#   cp .env.example .env   # then fill in API keys
+#   docker compose up -d
+#
+# All ports are bound to 127.0.0.1 — nothing is exposed to the LAN.
+
+services:
+  # One-shot init container: ensures the data volume is owned by 1000:1000
+  # so the non-root openclaw service can write to it on first run.
+  init-permissions:
+    image: busybox:latest
+    volumes:
+      - openclaw-data:/data
+      - ./plugins:/plugins:ro
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /data/extensions/searxng-search
+        cp /plugins/searxng-search/* /data/extensions/searxng-search/
+        chown -R 1000:1000 /data
+        chmod 755 /data/extensions /data/extensions/searxng-search
+        chmod 644 /data/extensions/searxng-search/*
+    restart: "no"
+
+  # Stage 1: build upstream OpenClaw image from source
+  openclaw-base:
+    build:
+      context: ${OPENCLAW_SRC_DIR:?Set OPENCLAW_SRC_DIR in .env to the openclaw repo path}
+      dockerfile: Dockerfile
+    image: openclaw:local
+    profiles: ["build-only"]       # never started as a service
+
+  # Stage 2: layer custom packages (psycopg2, etc.) on top
+  openclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        OPENCLAW_IMAGE: openclaw:local
+    image: openclaw:custom
+    container_name: openclaw-gateway
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+      searxng:
+        condition: service_healthy
+
+    # --- security hardening ---
+    user: "1000:1000"                     # node user from base image
+    read_only: true                       # immutable root filesystem
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # No privileged, no host network, no docker socket.
+
+    # --- resource limits ---
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          memory: 512M
+
+    # --- networking ---
+    ports:
+      - "127.0.0.1:${OPENCLAW_HOST_PORT:-3210}:18789"
+    networks:
+      - openclaw-internal
+    # Route host.docker.internal to host (needed on Linux; Docker Desktop has it built-in)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # --- environment overrides (non-secret) ---
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      NODE_ENV: production
+      # Override Ollama's hardcoded 127.0.0.1 default to reach host
+      OLLAMA_API_BASE: http://host.docker.internal:11434
+
+    # --- volumes ---
+    # Named volume for persistent state (config, sessions, memory DB).
+    # Writable tmpfs for Node runtime temp files.
+    volumes:
+      - openclaw-data:/home/node/.openclaw
+      - ./workspace:/home/node/.openclaw/workspace
+    tmpfs:
+      - /tmp:size=256M,mode=1777
+
+    # --- healthcheck ---
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18789/health').then(r=>{if(!r.ok)throw 1})"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    # --- command ---
+    command:
+      [
+        "node", "openclaw.mjs", "gateway",
+        "--allow-unconfigured",
+        "--bind", "lan",
+        "--port", "18789",
+      ]
+
+  # --- SearXNG fallback search engine (internal-only, no host ports) ---
+  valkey:
+    image: docker.io/valkey/valkey:8-alpine
+    container_name: openclaw-valkey
+    restart: unless-stopped
+    networks:
+      - openclaw-internal
+    volumes:
+      - valkey-data:/data
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    command: ["valkey-server", "--save", "60", "1", "--loglevel", "warning"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # --- Docker Socket Proxy (least-privilege access for the observer) ---
+  # Only the proxy touches the real Docker socket. The observer connects
+  # via TCP and can ONLY list/inspect/stop containers and read logs.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: openclaw-socket-proxy
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Deny everything by default, then allowlist:
+      CONTAINERS: 1        # GET /containers/* (list, inspect, logs)
+      POST: 1              # POST /containers/*/stop (lockdown)
+      # Everything else stays at default 0 (denied):
+      # IMAGES, NETWORKS, VOLUMES, SERVICES, TASKS, NODES, etc.
+    networks:
+      - observer-net
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE   # haproxy needs to bind port 2375
+
+  # --- External Observer (security monitor, runs OUTSIDE the agent's reach) ---
+  observer:
+    build:
+      context: ./observer
+      dockerfile: Dockerfile
+    image: openclaw-observer:local
+    container_name: openclaw-observer
+    restart: unless-stopped
+    depends_on:
+      openclaw:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - openclaw-data:/openclaw-data:ro    # read-only access to session JSONL files
+    environment:
+      # Connect to Docker via the socket proxy (NOT the raw socket)
+      DOCKER_HOST: "tcp://docker-socket-proxy:2375"
+      # Path to session JSONL files (read-only mount)
+      SESSION_LOG_DIR: "/openclaw-data/agents"
+      # Uses a SEPARATE admin bot — agent cannot see or interfere with these messages
+      TELEGRAM_BOT_TOKEN: "${OBSERVER_TELEGRAM_BOT_TOKEN}"
+      TELEGRAM_CHAT_ID: "${OBSERVER_TELEGRAM_CHAT_ID:-}"
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_MODEL: "${OBSERVER_MODEL:-qwen2.5:14b}"
+      TARGET_CONTAINER: "openclaw-gateway"
+      LOG_LEVEL: "INFO"
+      BATCH_SIZE: "10"
+      BATCH_TIMEOUT_SECONDS: "10"
+      ALERT_COOLDOWN_SECONDS: "60"
+      AUTO_LOCKDOWN: "${OBSERVER_AUTO_LOCKDOWN:-true}"
+      MAX_OLLAMA_FAILURES: "3"
+      HEARTBEAT_INTERVAL: "300"
+    networks:
+      - observer-net
+    # Observer is NOT on the openclaw-internal network — it cannot talk to
+    # SearXNG, Valkey, or the gateway API. It only reaches the socket proxy
+    # (on observer-net), Ollama (host), and Telegram API (internet).
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: openclaw-searxng
+    restart: unless-stopped
+    depends_on:
+      valkey:
+        condition: service_healthy
+    networks:
+      - openclaw-internal
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      SEARXNG_BASE_URL: "http://searxng:8080/"
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+      - CHOWN
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  openclaw-data:
+    name: openclaw-data
+  valkey-data:
+    name: openclaw-valkey-data
+
+networks:
+  openclaw-internal:
+    driver: bridge
+    internal: false          # set to true for full egress lockdown (see README)
+  observer-net:
+    driver: bridge           # observer ↔ socket-proxy only

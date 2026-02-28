@@ -1,0 +1,19 @@
+{
+  "id": "searxng-search",
+  "name": "SearXNG Search",
+  "description": "Web search via local SearXNG instance. Fallback when Brave Search quota is depleted.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "SearXNG base URL (default: http://searxng:8080)"
+      },
+      "maxResults": {
+        "type": "number",
+        "description": "Maximum results to return (default: 5)"
+      }
+    }
+  }
+}
